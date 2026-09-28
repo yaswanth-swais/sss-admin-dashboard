@@ -1,0 +1,1 @@
+'use client'; import AdminShell from '../../components/layout/AdminShell'; export default function Teachers(){return <AdminShell activeTab="teachers"><section className="mx-auto max-w-[1400px]"><h2 className="text-3xl font-bold sm:text-4xl">Teacher Management</h2><p className="mt-2 text-white/55">Teacher records and active status.</p></section></AdminShell>}

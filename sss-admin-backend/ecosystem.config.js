@@ -1,0 +1,1 @@
+module.exports={apps:[{name:'sss-admin-backend',cwd:__dirname,script:'.venv/bin/uvicorn',args:`app.main:app --host 0.0.0.0 --port ${process.env.PORT||8001}`,interpreter:'none',env:{PYTHONUNBUFFERED:'1'}}]};

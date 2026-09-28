@@ -1,0 +1,15 @@
+@"
+# Frontend
+sss-admin-frontend/node_modules/
+sss-admin-frontend/.next/
+sss-admin-frontend/.env.local
+sss-admin-frontend/.env*
+
+# Backend
+sss-admin-backend/.venv/
+sss-admin-backend/__pycache__/
+sss-admin-backend/.env
+
+# General
+*.pyc
+__pycache__/

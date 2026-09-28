@@ -1,0 +1,1 @@
+'use client'; import AdminShell from '../../components/layout/AdminShell'; export default function Others(){return <AdminShell activeTab="others"><section className="mx-auto max-w-[1400px]"><h2 className="text-3xl font-bold sm:text-4xl">Others</h2><p className="mt-2 text-white/55">Notices and events will be connected here.</p></section></AdminShell>}

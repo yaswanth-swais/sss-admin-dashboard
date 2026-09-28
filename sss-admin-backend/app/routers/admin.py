@@ -1,0 +1,2467 @@
+﻿from pathlib import Path
+from datetime import date
+from uuid import uuid4
+import re
+
+import boto3
+from botocore.config import Config
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+)
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import settings
+from app.db import get_db
+
+
+router = APIRouter(
+    prefix="/api/admin",
+    tags=["SSS Admin"],
+)
+
+
+s3 = boto3.client(
+    "s3",
+    aws_access_key_id=settings.aws_access_key_id,
+    aws_secret_access_key=settings.aws_secret_access_key,
+    region_name=settings.aws_region,
+    endpoint_url=f"https://s3.{settings.aws_region}.amazonaws.com",
+    config=Config(
+        signature_version="s3v4",
+        s3={"addressing_style": "virtual"},
+    ),
+)
+
+
+PHOTO_TYPES = {"student", "parent1", "parent2", "guardian"}
+
+PARENT_RELATIONSHIPS = {
+    "parent1": {
+        "name": "parent1_name",
+        "phone": "parent1_phone",
+        "email": "parent1_email",
+        "relationship": "father",
+    },
+    "parent2": {
+        "name": "parent2_name",
+        "phone": "parent2_phone",
+        "email": "parent2_email",
+        "relationship": "mother",
+    },
+    "guardian": {
+        "name": "guardian_name",
+        "phone": "guardian_phone",
+        "email": "guardian_email",
+        "relationship": "guardian",
+    },
+}
+
+
+PARENT_FIELDS = {
+    "parent1_name",
+    "parent1_phone",
+    "parent1_email",
+    "parent2_name",
+    "parent2_phone",
+    "parent2_email",
+    "guardian_name",
+    "guardian_phone",
+    "guardian_email",
+}
+
+
+STUDENT_FIELDS = {
+    "name",
+    "roll_number",
+    "gender",
+    "class_id",
+    "section",
+    "student_email",
+    "student_phone",
+    "admission_no",
+}
+
+
+# Parent information is intentionally sourced from Parent Master + Mapping.
+# The old parent columns in sss_student_master are not used for new writes.
+PARENT_SELECT_JOINS = """
+LEFT JOIN LATERAL (
+    SELECT
+        p.parent_id,
+        p.full_name,
+        p.phone,
+        p.email,
+        p.profile_image
+    FROM public.sss_parent_student_map m
+    INNER JOIN public.sss_parent_master p
+        ON p.parent_id = m.parent_id
+    WHERE m.student_id = s.student_id
+      AND m.relationship_type = 'father'
+    ORDER BY m.id
+    LIMIT 1
+) father ON TRUE
+
+LEFT JOIN LATERAL (
+    SELECT
+        p.parent_id,
+        p.full_name,
+        p.phone,
+        p.email,
+        p.profile_image
+    FROM public.sss_parent_student_map m
+    INNER JOIN public.sss_parent_master p
+        ON p.parent_id = m.parent_id
+    WHERE m.student_id = s.student_id
+      AND m.relationship_type = 'mother'
+    ORDER BY m.id
+    LIMIT 1
+) mother ON TRUE
+
+LEFT JOIN LATERAL (
+    SELECT
+        p.parent_id,
+        p.full_name,
+        p.phone,
+        p.email,
+        p.profile_image
+    FROM public.sss_parent_student_map m
+    INNER JOIN public.sss_parent_master p
+        ON p.parent_id = m.parent_id
+    WHERE m.student_id = s.student_id
+      AND m.relationship_type = 'guardian'
+    ORDER BY m.id
+    LIMIT 1
+) guardian ON TRUE
+"""
+
+
+def make_photo_url(key: str | None):
+    if not key:
+        return None
+
+    try:
+        return s3.generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": settings.s3_bucket_name,
+                "Key": key,
+            },
+            ExpiresIn=3600,
+        )
+    except Exception:
+        return None
+
+
+def serialize_student(row):
+    item = dict(row)
+
+    item["ui_id"] = f"S{int(item['student_id']):04d}"
+
+    item["student_photo_url"] = make_photo_url(
+        item.get("student_photo_key")
+    )
+
+    item["parent1_photo_url"] = make_photo_url(
+        item.get("parent1_photo_key")
+    )
+    item["parent2_photo_url"] = make_photo_url(
+        item.get("parent2_photo_key")
+    )
+    item["guardian_photo_url"] = make_photo_url(
+        item.get("guardian_photo_key")
+    )
+
+    return item
+
+
+async def validate_parent_input(
+    full_name: str | None,
+    email: str | None,
+    phone: str | None,
+    relationship_type: str,
+):
+    name = str(full_name or "").strip()
+    parent_email = str(email or "").strip().lower()
+    parent_phone = str(phone or "").strip()
+
+    has_any = bool(name or parent_email or parent_phone)
+
+    if not has_any:
+        return {
+            "name": "",
+            "email": "",
+            "phone": "",
+            "has_data": False,
+        }
+
+    # A supplied parent section must be complete.
+    if not name:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{relationship_type.title()} name is required",
+        )
+
+    if not parent_phone:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{relationship_type.title()} phone is required",
+        )
+
+    if not parent_email:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{relationship_type.title()} email is required",
+        )
+
+    if not parent_email.endswith("@gmail.com"):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{relationship_type.title()} email "
+                "must end with @gmail.com"
+            ),
+        )
+
+    if not parent_phone.isdigit() or len(parent_phone) != 10:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{relationship_type.title()} phone "
+                "must contain exactly 10 digits"
+            ),
+        )
+
+    return {
+        "name": name,
+        "email": parent_email,
+        "phone": parent_phone,
+        "has_data": True,
+    }
+
+
+async def validate_at_least_one_parent(
+    payload: dict,
+):
+    supplied = False
+
+    for config in PARENT_RELATIONSHIPS.values():
+        values = (
+            payload.get(config["name"]),
+            payload.get(config["phone"]),
+            payload.get(config["email"]),
+        )
+
+        if any(str(value or "").strip() for value in values):
+            supplied = True
+            break
+
+    if not supplied:
+        raise HTTPException(
+            status_code=422,
+            detail="At least one parent or guardian is required",
+        )
+
+
+async def create_parent_and_mapping(
+    db: AsyncSession,
+    student_id: int,
+    full_name: str | None,
+    email: str | None,
+    phone: str | None,
+    relationship_type: str,
+):
+    parent = await validate_parent_input(
+        full_name=full_name,
+        email=email,
+        phone=phone,
+        relationship_type=relationship_type,
+    )
+
+    if not parent["has_data"]:
+        return None
+
+    parent_result = await db.execute(
+        text(
+            """
+            INSERT INTO public.sss_parent_master (
+                full_name,
+                email,
+                phone,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                :full_name,
+                :email,
+                :phone,
+                CURRENT_TIMESTAMP,
+                CURRENT_TIMESTAMP
+            )
+            RETURNING parent_id
+            """
+        ),
+        {
+            "full_name": parent["name"],
+            "email": parent["email"],
+            "phone": parent["phone"],
+        },
+    )
+
+    parent_row = parent_result.mappings().first()
+
+    if not parent_row:
+        raise HTTPException(
+            status_code=500,
+            detail="Parent could not be created",
+        )
+
+    parent_id = parent_row["parent_id"]
+
+    await db.execute(
+        text(
+            """
+            INSERT INTO public.sss_parent_student_map (
+                parent_id,
+                student_id,
+                relationship_type
+            )
+            VALUES (
+                :parent_id,
+                :student_id,
+                :relationship_type
+            )
+            """
+        ),
+        {
+            "parent_id": parent_id,
+            "student_id": student_id,
+            "relationship_type": relationship_type,
+        },
+    )
+
+    return parent_id
+
+
+async def create_student_parents(
+    db: AsyncSession,
+    student_id: int,
+    payload: dict,
+):
+    await validate_at_least_one_parent(payload)
+
+    for config in PARENT_RELATIONSHIPS.values():
+        await create_parent_and_mapping(
+            db=db,
+            student_id=student_id,
+            full_name=payload.get(config["name"]),
+            email=payload.get(config["email"]),
+            phone=payload.get(config["phone"]),
+            relationship_type=config["relationship"],
+        )
+
+
+async def get_current_parent_for_relationship(
+    db: AsyncSession,
+    student_id: int,
+    relationship_type: str,
+):
+    result = await db.execute(
+        text(
+            """
+            SELECT
+                m.id AS mapping_id,
+                m.parent_id,
+                p.full_name,
+                p.email,
+                p.phone
+            FROM public.sss_parent_student_map m
+            INNER JOIN public.sss_parent_master p
+                ON p.parent_id = m.parent_id
+            WHERE m.student_id = :student_id
+              AND m.relationship_type = :relationship_type
+            ORDER BY m.id
+            LIMIT 1
+            """
+        ),
+        {
+            "student_id": student_id,
+            "relationship_type": relationship_type,
+        },
+    )
+
+    return result.mappings().first()
+
+
+async def sync_existing_parent(
+    db: AsyncSession,
+    student_id: int,
+    full_name: str | None,
+    email: str | None,
+    phone: str | None,
+    relationship_type: str,
+):
+    parent = await validate_parent_input(
+        full_name=full_name,
+        email=email,
+        phone=phone,
+        relationship_type=relationship_type,
+    )
+
+    mapping = await get_current_parent_for_relationship(
+        db=db,
+        student_id=student_id,
+        relationship_type=relationship_type,
+    )
+
+    # Relationship was explicitly cleared during Modify.
+    if not parent["has_data"]:
+        if mapping:
+            old_parent_id = mapping["parent_id"]
+
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM public.sss_parent_student_map
+                    WHERE id = :mapping_id
+                    """
+                ),
+                {"mapping_id": mapping["mapping_id"]},
+            )
+
+            # Never leave an orphan parent record.
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM public.sss_parent_master
+                    WHERE parent_id = :parent_id
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM public.sss_parent_student_map
+                          WHERE parent_id = :parent_id
+                      )
+                    """
+                ),
+                {"parent_id": old_parent_id},
+            )
+
+        return None
+
+    # Existing relationship -> update the SAME parent_id.
+    if mapping:
+        await db.execute(
+            text(
+                """
+                UPDATE public.sss_parent_master
+                SET
+                    full_name = :full_name,
+                    email = :email,
+                    phone = :phone,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE parent_id = :parent_id
+                """
+            ),
+            {
+                "parent_id": mapping["parent_id"],
+                "full_name": parent["name"],
+                "email": parent["email"],
+                "phone": parent["phone"],
+            },
+        )
+
+        return mapping["parent_id"]
+
+    # New relationship added during Modify -> create one new parent row + map.
+    return await create_parent_and_mapping(
+        db=db,
+        student_id=student_id,
+        full_name=parent["name"],
+        email=parent["email"],
+        phone=parent["phone"],
+        relationship_type=relationship_type,
+    )
+
+
+async def sync_student_parents(
+    db: AsyncSession,
+    student_id: int,
+    payload: dict,
+    only_if_present: bool = False,
+):
+    for config in PARENT_RELATIONSHIPS.values():
+        parent_fields_present = any(
+            key in payload
+            for key in (
+                config["name"],
+                config["phone"],
+                config["email"],
+            )
+        )
+
+        if only_if_present and not parent_fields_present:
+            continue
+
+        # During partial Modify requests, merge omitted values with the existing parent.
+        values = {
+            "name": payload.get(config["name"]),
+            "phone": payload.get(config["phone"]),
+            "email": payload.get(config["email"]),
+        }
+
+        if only_if_present and parent_fields_present:
+            current = await get_current_parent_for_relationship(
+                db=db,
+                student_id=student_id,
+                relationship_type=config["relationship"],
+            )
+
+            if current:
+                if config["name"] not in payload:
+                    values["name"] = current["full_name"]
+                if config["phone"] not in payload:
+                    values["phone"] = current["phone"]
+                if config["email"] not in payload:
+                    values["email"] = current["email"]
+
+        await sync_existing_parent(
+            db=db,
+            student_id=student_id,
+            full_name=values["name"],
+            email=values["email"],
+            phone=values["phone"],
+            relationship_type=config["relationship"],
+        )
+
+
+async def get_parent_id_for_student_relationship(
+    db: AsyncSession,
+    student_id: int,
+    relationship_type: str,
+):
+    result = await db.execute(
+        text(
+            """
+            SELECT parent_id
+            FROM public.sss_parent_student_map
+            WHERE student_id = :student_id
+              AND relationship_type = :relationship_type
+            ORDER BY id
+            LIMIT 1
+            """
+        ),
+        {
+            "student_id": student_id,
+            "relationship_type": relationship_type,
+        },
+    )
+
+    row = result.mappings().first()
+    return row["parent_id"] if row else None
+
+
+@router.get("/config")
+async def get_admin_config():
+    return {
+        "logout_url": settings.logout_redirect_url,
+    }
+
+
+@router.get("/classes")
+async def get_classes(
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        text(
+            """
+            SELECT
+                class_id,
+                class_name,
+                section_name,
+                academic_year
+            FROM public.sss_class_master
+            WHERE COALESCE(record_status, 'A') <> 'D'
+            ORDER BY
+                class_name,
+                section_name,
+                academic_year
+            """
+        )
+    )
+
+    return [
+        {
+            "class_id": row["class_id"],
+            "class_name": row["class_name"],
+            "section_name": row["section_name"],
+            "academic_year": row["academic_year"],
+            "label": " ".join(
+                x
+                for x in [row["class_name"], row["section_name"]]
+                if x
+            ),
+        }
+        for row in result.mappings()
+    ]
+
+
+@router.get("/students")
+async def get_students(
+    search: str | None = Query(default=None),
+    class_id: int | None = Query(default=None),
+    status: str | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+):
+    conditions = ["COALESCE(s.record_status, 'A') <> 'D'"]
+    params = {}
+
+    if class_id is not None:
+        conditions.append("s.class_id = :class_id")
+        params["class_id"] = class_id
+
+    if status == "active":
+        conditions.append("COALESCE(s.is_active, FALSE) = TRUE")
+    elif status == "inactive":
+        conditions.append("COALESCE(s.is_active, FALSE) = FALSE")
+
+    if search:
+        conditions.append(
+            """
+            (
+                s.name ILIKE :search
+                OR s.student_email ILIKE :search
+                OR s.student_phone ILIKE :search
+                OR s.admission_no ILIKE :search
+                OR s.roll_number ILIKE :search
+            )
+            """
+        )
+        params["search"] = f"%{search.strip()}%"
+
+    where_clause = " AND ".join(conditions)
+
+    result = await db.execute(
+        text(
+            f"""
+            SELECT
+                s.student_id,
+                s.name,
+                s.roll_number,
+                s.gender,
+                s.student_email,
+                s.student_phone,
+                s.admission_no,
+                s.class_id,
+                s.class_name,
+                s.section,
+                s.is_active,
+                s.record_status,
+                s.student_photo_key,
+
+                father.parent_id AS parent1_id,
+                father.full_name AS parent1_name,
+                father.phone AS parent1_phone,
+                father.email AS parent1_email,
+                father.profile_image AS parent1_photo_key,
+
+                mother.parent_id AS parent2_id,
+                mother.full_name AS parent2_name,
+                mother.phone AS parent2_phone,
+                mother.email AS parent2_email,
+                mother.profile_image AS parent2_photo_key,
+
+                guardian.parent_id AS guardian_parent_id,
+                guardian.full_name AS guardian_name,
+                guardian.phone AS guardian_phone,
+                guardian.email AS guardian_email,
+                guardian.profile_image AS guardian_photo_key
+
+            FROM public.sss_student_master s
+            {PARENT_SELECT_JOINS}
+            WHERE {where_clause}
+            ORDER BY s.student_id DESC
+            """
+        ),
+        params,
+    )
+
+    students = [
+        serialize_student(row)
+        for row in result.mappings()
+    ]
+
+    total = len(students)
+    active = sum(
+        1
+        for student in students
+        if student["is_active"] is True
+    )
+
+    inactive = total - active
+
+    return {
+        "items": students,
+        "total": total,
+        "active": active,
+        "inactive": inactive,
+    }
+
+
+@router.get("/students/{student_id}")
+async def get_student(
+    student_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        text(
+            f"""
+            SELECT
+                s.student_id,
+                s.name,
+                s.roll_number,
+                s.gender,
+                s.student_email,
+                s.student_phone,
+                s.admission_no,
+                s.class_id,
+                s.class_name,
+                s.section,
+
+                c.academic_year,
+
+                s.is_active,
+                s.record_status,
+                s.student_photo_key,
+
+                father.parent_id AS parent1_id,
+                father.full_name AS parent1_name,
+                father.phone AS parent1_phone,
+                father.email AS parent1_email,
+                father.profile_image AS parent1_photo_key,
+
+                mother.parent_id AS parent2_id,
+                mother.full_name AS parent2_name,
+                mother.phone AS parent2_phone,
+                mother.email AS parent2_email,
+                mother.profile_image AS parent2_photo_key,
+
+                guardian.parent_id AS guardian_parent_id,
+                guardian.full_name AS guardian_name,
+                guardian.phone AS guardian_phone,
+                guardian.email AS guardian_email,
+                guardian.profile_image AS guardian_photo_key,
+
+                s.admin_email,
+                s.admin_phone,
+                s.version_no,
+                s.created_at,
+                s.updated_at
+
+            FROM public.sss_student_master s
+            LEFT JOIN public.sss_class_master c
+                ON c.class_id = s.class_id
+            {PARENT_SELECT_JOINS}
+            WHERE s.student_id = :student_id
+              AND COALESCE(s.record_status, 'A') <> 'D'
+            """
+        ),
+        {"student_id": student_id},
+    )
+
+    row = result.mappings().first()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Student not found",
+        )
+
+    return serialize_student(row)
+
+
+@router.patch("/students/{student_id}/status")
+async def update_student_status(
+    student_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        text(
+            """
+            UPDATE public.sss_student_master
+            SET
+                is_active = NOT COALESCE(is_active, FALSE),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE student_id = :student_id
+              AND COALESCE(record_status, 'A') <> 'D'
+            RETURNING student_id, is_active
+            """
+        ),
+        {"student_id": student_id},
+    )
+
+    row = result.mappings().first()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Student not found",
+        )
+
+    await db.commit()
+
+    return {
+        "student_id": row["student_id"],
+        "is_active": row["is_active"],
+    }
+
+
+@router.post("/students")
+async def create_student(
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    required = [
+        "name",
+        "admission_no",
+        "roll_number",
+        "gender",
+        "class_id",
+        "section",
+        "student_phone",
+        "student_email",
+    ]
+
+    for field in required:
+        value = payload.get(field)
+        if value is None or str(value).strip() == "":
+            raise HTTPException(
+                status_code=422,
+                detail=f"{field} is required",
+            )
+
+    phone = str(payload["student_phone"]).strip()
+    if not phone.isdigit() or len(phone) != 10:
+        raise HTTPException(
+            status_code=422,
+            detail="Student phone must contain exactly 10 digits",
+        )
+
+    email = str(payload["student_email"]).strip().lower()
+    if not email.endswith("@gmail.com"):
+        raise HTTPException(
+            status_code=422,
+            detail="Student email must end with @gmail.com",
+        )
+
+    class_result = await db.execute(
+        text(
+            """
+            SELECT
+                class_name,
+                section_name
+            FROM public.sss_class_master
+            WHERE class_id = :class_id
+              AND COALESCE(record_status, 'A') <> 'D'
+            """
+        ),
+        {"class_id": payload["class_id"]},
+    )
+
+    class_row = class_result.mappings().first()
+
+    if not class_row:
+        raise HTTPException(
+            status_code=422,
+            detail="Selected class does not exist",
+        )
+
+    # Parent business rule: one, two or three parent/guardian sections
+    # may be supplied, but at least one is required.
+    await validate_at_least_one_parent(payload)
+
+    result = await db.execute(
+        text(
+            """
+            INSERT INTO public.sss_student_master (
+                name,
+                roll_number,
+                gender,
+                class_id,
+                class_name,
+                section,
+                student_email,
+                student_phone,
+                admission_no,
+                is_active,
+                record_status,
+                version_no,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                :name,
+                :roll_number,
+                :gender,
+                :class_id,
+                :class_name,
+                :section,
+                :student_email,
+                :student_phone,
+                :admission_no,
+                TRUE,
+                'A',
+                1,
+                CURRENT_TIMESTAMP,
+                CURRENT_TIMESTAMP
+            )
+            RETURNING student_id
+            """
+        ),
+        {
+            "name": str(payload["name"]).strip(),
+            "roll_number": str(payload["roll_number"]).strip(),
+            "gender": payload["gender"],
+            "class_id": payload["class_id"],
+            "class_name": class_row["class_name"],
+            "section": class_row["section_name"],
+            "student_email": email,
+            "student_phone": phone,
+            "admission_no": str(payload["admission_no"]).strip(),
+        },
+    )
+
+    row = result.mappings().first()
+
+    if not row:
+        raise HTTPException(
+            status_code=500,
+            detail="Student could not be created",
+        )
+
+    await create_student_parents(
+        db=db,
+        student_id=row["student_id"],
+        payload=payload,
+    )
+
+    await db.commit()
+
+    return await get_student(
+        row["student_id"],
+        db,
+    )
+
+
+@router.put("/students/{student_id}")
+async def update_student(
+    student_id: int,
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    updates = {
+        key: value
+        for key, value in payload.items()
+        if key in STUDENT_FIELDS
+    }
+
+    parent_fields_present = bool(PARENT_FIELDS.intersection(payload.keys()))
+
+    if not updates and not parent_fields_present:
+        raise HTTPException(
+            status_code=422,
+            detail="No fields to update",
+        )
+
+    if "student_phone" in updates:
+        phone = str(updates["student_phone"]).strip()
+        if not phone.isdigit() or len(phone) != 10:
+            raise HTTPException(
+                status_code=422,
+                detail="Student phone must contain exactly 10 digits",
+            )
+        updates["student_phone"] = phone
+
+    if "student_email" in updates:
+        email = str(updates["student_email"]).strip().lower()
+        if not email.endswith("@gmail.com"):
+            raise HTTPException(
+                status_code=422,
+                detail="Student email must end with @gmail.com",
+            )
+        updates["student_email"] = email
+
+    if "class_id" in updates:
+        class_result = await db.execute(
+            text(
+                """
+                SELECT
+                    class_name,
+                    section_name
+                FROM public.sss_class_master
+                WHERE class_id = :class_id
+                  AND COALESCE(record_status, 'A') <> 'D'
+                """
+            ),
+            {"class_id": updates["class_id"]},
+        )
+
+        class_row = class_result.mappings().first()
+
+        if not class_row:
+            raise HTTPException(
+                status_code=422,
+                detail="Selected class does not exist",
+            )
+
+        updates["class_name"] = class_row["class_name"]
+        updates["section"] = class_row["section_name"]
+
+    if updates:
+        set_parts = [
+            f"{key} = :{key}"
+            for key in updates
+        ]
+        set_parts.append("updated_at = CURRENT_TIMESTAMP")
+        set_clause = ", ".join(set_parts)
+
+        result = await db.execute(
+            text(
+                f"""
+                UPDATE public.sss_student_master
+                SET
+                    {set_clause},
+                    version_no = COALESCE(version_no, 0) + 1
+                WHERE student_id = :student_id
+                  AND COALESCE(record_status, 'A') <> 'D'
+                RETURNING student_id
+                """
+            ),
+            {
+                **updates,
+                "student_id": student_id,
+            },
+        )
+
+        row = result.mappings().first()
+
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail="Student not found",
+            )
+    else:
+        # Parent-only update still needs to verify the Student exists.
+        check = await db.execute(
+            text(
+                """
+                SELECT student_id
+                FROM public.sss_student_master
+                WHERE student_id = :student_id
+                  AND COALESCE(record_status, 'A') <> 'D'
+                """
+            ),
+            {"student_id": student_id},
+        )
+
+        if not check.mappings().first():
+            raise HTTPException(
+                status_code=404,
+                detail="Student not found",
+            )
+
+    if parent_fields_present:
+        await sync_student_parents(
+            db=db,
+            student_id=student_id,
+            payload=payload,
+            only_if_present=True,
+        )
+
+    await db.commit()
+
+    return await get_student(
+        student_id,
+        db,
+    )
+
+
+@router.delete("/students/{student_id}")
+async def delete_student(
+    student_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        text(
+            """
+            UPDATE public.sss_student_master
+            SET
+                record_status = 'D',
+                is_active = FALSE,
+                updated_at = CURRENT_TIMESTAMP,
+                version_no = COALESCE(version_no, 0) + 1
+            WHERE student_id = :student_id
+              AND COALESCE(record_status, 'A') <> 'D'
+            RETURNING student_id
+            """
+        ),
+        {"student_id": student_id},
+    )
+
+    row = result.mappings().first()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Student not found",
+        )
+
+    await db.commit()
+
+    return {
+        "message": "Student deleted",
+        "student_id": row["student_id"],
+    }
+
+
+@router.post("/students/{student_id}/photos")
+async def upload_student_photo(
+    student_id: int,
+    photo_type: str = Form(...),
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    if photo_type not in PHOTO_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid photo type",
+        )
+
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=422,
+            detail="Only image files are allowed",
+        )
+
+    extension = Path(file.filename or "photo.jpg").suffix.lower()
+
+    if extension not in {".jpg", ".jpeg", ".png", ".webp"}:
+        raise HTTPException(
+            status_code=422,
+            detail="Allowed image types: JPG, JPEG, PNG, WEBP",
+        )
+
+    check = await db.execute(
+        text(
+            """
+            SELECT student_id
+            FROM public.sss_student_master
+            WHERE student_id = :student_id
+              AND COALESCE(record_status, 'A') <> 'D'
+            """
+        ),
+        {"student_id": student_id},
+    )
+
+    if not check.mappings().first():
+        raise HTTPException(
+            status_code=404,
+            detail="Student not found",
+        )
+
+    parent_relationship = {
+        "parent1": "father",
+        "parent2": "mother",
+        "guardian": "guardian",
+    }
+
+    parent_id = None
+
+    if photo_type != "student":
+        parent_id = await get_parent_id_for_student_relationship(
+            db=db,
+            student_id=student_id,
+            relationship_type=parent_relationship[photo_type],
+        )
+
+        if not parent_id:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Parent details must be added before "
+                    "uploading the parent photo"
+                ),
+            )
+
+    if photo_type == "student":
+        key = (
+            f"sss/admin/students/"
+            f"{student_id}/student/"
+            f"{uuid4().hex}{extension}"
+        )
+    else:
+        key = (
+            f"sss/admin/parents/"
+            f"{parent_id}/profile/"
+            f"{uuid4().hex}{extension}"
+        )
+
+    try:
+        s3.upload_fileobj(
+            file.file,
+            settings.s3_bucket_name,
+            key,
+            ExtraArgs={"ContentType": file.content_type},
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"S3 upload failed: {exc}",
+        )
+
+    try:
+        if photo_type == "student":
+            await db.execute(
+                text(
+                    """
+                    UPDATE public.sss_student_master
+                    SET
+                        student_photo_key = :key,
+                        updated_at = CURRENT_TIMESTAMP,
+                        version_no = COALESCE(version_no, 0) + 1
+                    WHERE student_id = :student_id
+                      AND COALESCE(record_status, 'A') <> 'D'
+                    """
+                ),
+                {
+                    "key": key,
+                    "student_id": student_id,
+                },
+            )
+        else:
+            await db.execute(
+                text(
+                    """
+                    UPDATE public.sss_parent_master
+                    SET
+                        profile_image = :profile_image,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE parent_id = :parent_id
+                    """
+                ),
+                {
+                    "profile_image": key,
+                    "parent_id": parent_id,
+                },
+            )
+
+        await db.commit()
+
+    except Exception as exc:
+        try:
+            s3.delete_object(
+                Bucket=settings.s3_bucket_name,
+                Key=key,
+            )
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Photo record update failed: {exc}",
+        )
+
+    return {
+        "photo_type": photo_type,
+        "key": key,
+        "url": make_photo_url(key),
+    }
+
+
+# ============================================================
+# TEACHERS
+# ============================================================
+
+TEACHER_CLASS_SUBJECT_MAP_TABLE = "public.sss_teacher_class_subject_map"
+
+
+def _normalize_teacher_assignments(payload: dict) -> list[dict]:
+    raw = payload.get("teaching_mappings")
+    if raw is None:
+        raw = payload.get("assignments")
+    if raw is None:
+        raw = payload.get("teachingMappings")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise HTTPException(status_code=422, detail="Teaching mappings must be an array")
+
+    normalized = []
+    seen = set()
+
+    for index, item in enumerate(raw, 1):
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=422, detail=f"Teaching mapping {index} is invalid")
+
+        class_id = item.get("class_id")
+        if class_id in (None, ""):
+            class_id = item.get("classId")
+
+        subject_name = str(
+            item.get("subject_name")
+            or item.get("subject")
+            or ""
+        ).strip()
+
+        is_class_teacher = bool(
+            item.get("is_class_teacher", item.get("isClassTeacher", False))
+        )
+
+        if class_id in (None, ""):
+            raise HTTPException(status_code=422, detail=f"Teaching mapping {index}: class is required")
+
+        try:
+            class_id = int(class_id)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail=f"Teaching mapping {index}: invalid class")
+
+        if not subject_name:
+            raise HTTPException(status_code=422, detail=f"Teaching mapping {index}: subject is required")
+
+        key = (class_id, subject_name.casefold())
+        if key in seen:
+            raise HTTPException(status_code=422, detail=f"Duplicate teaching mapping for class {class_id} and subject {subject_name}")
+
+        seen.add(key)
+        normalized.append({
+            "class_id": class_id,
+            "subject_name": subject_name,
+            "is_class_teacher": is_class_teacher,
+        })
+
+    return normalized
+
+
+async def _validate_teaching_mappings(db: AsyncSession, mappings: list[dict]):
+    for mapping in mappings:
+        result = await db.execute(
+            text("""
+                SELECT class_id, class_name, section_name, academic_year
+                FROM public.sss_class_master
+                WHERE class_id = :class_id
+                  AND COALESCE(record_status, 'A') <> 'D'
+            """),
+            {"class_id": mapping["class_id"]},
+        )
+        row = result.mappings().first()
+
+        if not row:
+            raise HTTPException(status_code=422, detail=f"Selected class {mapping['class_id']} does not exist")
+
+        academic_year = str(row["academic_year"] or "").strip()
+        if not academic_year:
+            raise HTTPException(status_code=422, detail=f"Academic year is not configured for class {mapping['class_id']}")
+
+        mapping["academic_year"] = academic_year
+
+
+async def _get_teacher_assignments(db: AsyncSession, teacher_id: str):
+    result = await db.execute(
+        text(f"""
+            SELECT
+                m.assignment_id,
+                m.teacher_id,
+                m.class_id,
+                c.class_name,
+                c.section_name,
+                m.subject_name,
+                m.academic_year,
+                m.is_class_teacher,
+                m.is_active,
+                m.created_at,
+                m.updated_at
+            FROM {TEACHER_CLASS_SUBJECT_MAP_TABLE} m
+            INNER JOIN public.sss_class_master c ON c.class_id = m.class_id
+            WHERE m.teacher_id = :teacher_id
+              AND m.is_active = TRUE
+              AND COALESCE(c.record_status, 'A') <> 'D'
+            ORDER BY c.class_name, c.section_name, m.subject_name, m.assignment_id
+        """),
+        {"teacher_id": teacher_id},
+    )
+    return [dict(row) for row in result.mappings()]
+
+
+async def _insert_teacher_mappings(db: AsyncSession, teacher_id: str, mappings: list[dict]):
+    for mapping in mappings:
+        await db.execute(
+            text(f"""
+                INSERT INTO {TEACHER_CLASS_SUBJECT_MAP_TABLE} (
+                    teacher_id, class_id, subject_name, academic_year,
+                    is_class_teacher, is_active, created_at, updated_at
+                )
+                VALUES (
+                    :teacher_id, :class_id, :subject_name, :academic_year,
+                    :is_class_teacher, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                ON CONFLICT (teacher_id, class_id, subject_name, academic_year)
+                DO UPDATE SET
+                    is_class_teacher = EXCLUDED.is_class_teacher,
+                    is_active = TRUE,
+                    updated_at = CURRENT_TIMESTAMP
+            """),
+            {"teacher_id": teacher_id, **mapping},
+        )
+
+
+async def _sync_teacher_mappings(db: AsyncSession, teacher_id: str, mappings: list[dict]):
+    await _validate_teaching_mappings(db, mappings)
+
+    # Preserve existing assignment_id values for unchanged class/subject/year
+    # combinations. Only genuinely new combinations get a new assignment_id.
+    existing_result = await db.execute(
+        text(f"""
+            SELECT
+                assignment_id,
+                teacher_id,
+                class_id,
+                subject_name,
+                academic_year,
+                is_class_teacher,
+                is_active
+            FROM {TEACHER_CLASS_SUBJECT_MAP_TABLE}
+            WHERE teacher_id = :teacher_id
+            ORDER BY assignment_id
+        """),
+        {"teacher_id": teacher_id},
+    )
+
+    existing_rows = [dict(row) for row in existing_result.mappings()]
+
+    # Make all current mappings inactive first.
+    await db.execute(
+        text(f"""
+            UPDATE {TEACHER_CLASS_SUBJECT_MAP_TABLE}
+            SET
+                is_active = FALSE,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE teacher_id = :teacher_id
+        """),
+        {"teacher_id": teacher_id},
+    )
+
+    for mapping in mappings:
+        matching_row = next(
+            (
+                row
+                for row in existing_rows
+                if int(row["class_id"]) == int(mapping["class_id"])
+                and str(row["subject_name"] or "").strip().casefold()
+                    == str(mapping["subject_name"] or "").strip().casefold()
+                and str(row["academic_year"] or "").strip()
+                    == str(mapping["academic_year"] or "").strip()
+            ),
+            None,
+        )
+
+        if matching_row:
+            await db.execute(
+                text(f"""
+                    UPDATE {TEACHER_CLASS_SUBJECT_MAP_TABLE}
+                    SET
+                        class_id = :class_id,
+                        subject_name = :subject_name,
+                        academic_year = :academic_year,
+                        is_class_teacher = :is_class_teacher,
+                        is_active = TRUE,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE assignment_id = :assignment_id
+                      AND teacher_id = :teacher_id
+                """),
+                {
+                    "assignment_id": matching_row["assignment_id"],
+                    "teacher_id": teacher_id,
+                    **mapping,
+                },
+            )
+        else:
+            await db.execute(
+                text(f"""
+                    INSERT INTO {TEACHER_CLASS_SUBJECT_MAP_TABLE} (
+                        teacher_id,
+                        class_id,
+                        subject_name,
+                        academic_year,
+                        is_class_teacher,
+                        is_active,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (
+                        :teacher_id,
+                        :class_id,
+                        :subject_name,
+                        :academic_year,
+                        :is_class_teacher,
+                        TRUE,
+                        CURRENT_TIMESTAMP,
+                        CURRENT_TIMESTAMP
+                    )
+                """),
+                {
+                    "teacher_id": teacher_id,
+                    **mapping,
+                },
+            )
+
+
+async def _teacher_response(db: AsyncSession, teacher_id: str):
+    result = await db.execute(
+        text("""
+            SELECT
+                teacher_id, class_id, full_name, email_id, phone, role,
+                is_active, qualification, record_status
+            FROM public.sss_teacher_master
+            WHERE teacher_id = :teacher_id
+              AND COALESCE(record_status, 'A') <> 'D'
+        """),
+        {"teacher_id": teacher_id},
+    )
+    row = result.mappings().first()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Teacher not found")
+
+    item = dict(row)
+
+    # Frontend-safe defaults for nullable legacy columns.
+    item["full_name"] = item.get("full_name") or ""
+    item["email_id"] = item.get("email_id") or ""
+    item["phone"] = item.get("phone") or ""
+    item["role"] = item.get("role") or ""
+    item["qualification"] = item.get("qualification") or ""
+
+    item["teaching_mappings"] = await _get_teacher_assignments(db, teacher_id)
+    return item
+
+
+@router.get("/teachers")
+async def get_teachers(
+    search: str | None = Query(default=None),
+    class_id: int | None = Query(default=None),
+    status: str | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+):
+    conditions = ["COALESCE(t.record_status, 'A') <> 'D'"]
+    params = {}
+
+    if class_id is not None:
+        conditions.append("""
+            EXISTS (
+                SELECT 1
+                FROM public.sss_teacher_class_subject_map tm
+                WHERE tm.teacher_id = t.teacher_id
+                  AND tm.class_id = :class_id
+                  AND tm.is_active = TRUE
+            )
+        """)
+        params["class_id"] = class_id
+
+    if status == "active":
+        conditions.append("COALESCE(t.is_active, FALSE) = TRUE")
+    elif status == "inactive":
+        conditions.append("COALESCE(t.is_active, FALSE) = FALSE")
+
+    if search:
+        conditions.append("""
+            (
+                t.teacher_id ILIKE :search
+                OR t.full_name ILIKE :search
+                OR t.email_id ILIKE :search
+                OR t.phone ILIKE :search
+                OR EXISTS (
+                    SELECT 1
+                    FROM public.sss_teacher_class_subject_map tm
+                    WHERE tm.teacher_id = t.teacher_id
+                      AND tm.is_active = TRUE
+                      AND tm.subject_name ILIKE :search
+                )
+            )
+        """)
+        params["search"] = f"%{search.strip()}%"
+
+    result = await db.execute(
+        text(f"""
+            SELECT
+                t.teacher_id, t.class_id, t.full_name, t.email_id, t.phone,
+                t.role, t.is_active, t.qualification, t.record_status
+            FROM public.sss_teacher_master t
+            WHERE {" AND ".join(conditions)}
+            ORDER BY t.teacher_id
+        """),
+        params,
+    )
+
+    items = []
+    for row in result.mappings():
+        item = dict(row)
+        item["teaching_mappings"] = await _get_teacher_assignments(db, item["teacher_id"])
+        items.append(item)
+
+    active = sum(1 for item in items if item["is_active"] is True)
+    return {
+        "items": items,
+        "total": len(items),
+        "active": active,
+        "inactive": len(items) - active,
+    }
+
+
+@router.get("/teachers/{teacher_id}")
+async def get_teacher(teacher_id: str, db: AsyncSession = Depends(get_db)):
+    try:
+        return await _teacher_response(db, teacher_id)
+    except HTTPException:
+        raise
+    except Exception:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to load teacher details")
+
+
+@router.get("/teachers/{teacher_id}/teaching-mappings")
+async def get_teacher_teaching_mappings(teacher_id: str, db: AsyncSession = Depends(get_db)):
+    await _teacher_response(db, teacher_id)
+    return {"teacher_id": teacher_id, "items": await _get_teacher_assignments(db, teacher_id)}
+
+
+@router.patch("/teachers/{teacher_id}/status")
+async def update_teacher_status(teacher_id: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        text("""
+            UPDATE public.sss_teacher_master
+            SET is_active = NOT COALESCE(is_active, FALSE),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE teacher_id = :teacher_id
+              AND COALESCE(record_status, 'A') <> 'D'
+            RETURNING teacher_id, is_active
+        """),
+        {"teacher_id": teacher_id},
+    )
+    row = result.mappings().first()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Teacher not found")
+
+    await db.execute(
+        text(f"""
+            UPDATE {TEACHER_CLASS_SUBJECT_MAP_TABLE}
+            SET is_active = :is_active, updated_at = CURRENT_TIMESTAMP
+            WHERE teacher_id = :teacher_id
+        """),
+        {"teacher_id": teacher_id, "is_active": bool(row["is_active"])},
+    )
+    await db.commit()
+    return dict(row)
+
+
+@router.post("/teachers")
+async def create_teacher(payload: dict, db: AsyncSession = Depends(get_db)):
+    full_name = str(payload.get("full_name") or payload.get("name") or "").strip()
+    phone = str(payload.get("phone") or "").strip()
+    email = str(payload.get("email_id") or payload.get("email") or "").strip().lower()
+
+    for label, value in (("full_name", full_name), ("phone", phone), ("email_id", email)):
+        if not value:
+            raise HTTPException(status_code=422, detail=f"{label} is required")
+
+    role = str(payload.get("role") or "Faculty").strip()
+    if role.casefold() == "teacher":
+        role = "Faculty"
+    elif role.casefold() == "faculty":
+        role = "Faculty"
+    elif role.casefold() == "headmaster":
+        role = "Headmaster"
+
+    if role not in {"Faculty", "Headmaster"}:
+        raise HTTPException(status_code=422, detail="Role must be Faculty or Headmaster")
+
+    if not phone.isdigit() or len(phone) != 10:
+        raise HTTPException(status_code=422, detail="Phone must contain exactly 10 digits")
+
+    if not re.fullmatch(r"[^\s@]+@gmail\.com", email, flags=re.IGNORECASE):
+        raise HTTPException(status_code=422, detail="Teacher email must be a valid Gmail address")
+
+    mappings = _normalize_teacher_assignments(payload)
+    if not mappings:
+        raise HTTPException(status_code=422, detail="At least one teaching class and subject is required")
+
+    await _validate_teaching_mappings(db, mappings)
+
+    duplicate = await db.execute(
+        text("""
+            SELECT teacher_id
+            FROM public.sss_teacher_master
+            WHERE LOWER(email_id) = LOWER(:email_id)
+              AND COALESCE(record_status, 'A') <> 'D'
+            LIMIT 1
+        """),
+        {"email_id": email},
+    )
+    if duplicate.mappings().first():
+        raise HTTPException(status_code=409, detail="Teacher email already exists")
+
+    result = await db.execute(
+        text("""
+            SELECT COALESCE(
+                MAX(
+                    CASE
+                        WHEN teacher_id ~ '^T[0-9]+$'
+                        THEN CAST(SUBSTRING(teacher_id FROM 2) AS INTEGER)
+                        ELSE 0
+                    END
+                ), 0
+            )
+            FROM public.sss_teacher_master
+        """)
+    )
+    teacher_id = f"T{int(result.scalar() or 0) + 1:03d}"
+
+    await db.execute(
+        text("""
+            INSERT INTO public.sss_teacher_master (
+                teacher_id, class_id, full_name, email_id, phone, subject_name,
+                role, is_active, qualification, is_class_teacher,
+                record_status, created_at, updated_at
+            )
+            VALUES (
+                :teacher_id, :class_id, :full_name, :email_id, :phone, :subject_name,
+                :role, TRUE, :qualification, :is_class_teacher,
+                'A', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+        """),
+        {
+            "teacher_id": teacher_id,
+            "class_id": mappings[0]["class_id"],
+            "full_name": full_name,
+            "email_id": email,
+            "phone": phone,
+            "subject_name": mappings[0]["subject_name"],
+            "role": role,
+            "qualification": str(payload.get("qualification") or "").strip() or None,
+            "is_class_teacher": bool(mappings[0]["is_class_teacher"]),
+        },
+    )
+
+    await _insert_teacher_mappings(db, teacher_id, mappings)
+
+    # Keep teacher_master.class_id populated from the selected class.
+    await db.execute(
+        text("""
+            UPDATE public.sss_teacher_master
+            SET
+                class_id = :class_id,
+                subject_name = :subject_name,
+                is_class_teacher = :is_class_teacher,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE teacher_id = :teacher_id
+        """),
+        {
+            "teacher_id": teacher_id,
+            "class_id": mappings[0]["class_id"],
+            "subject_name": mappings[0]["subject_name"],
+            "is_class_teacher": bool(mappings[0]["is_class_teacher"]),
+        },
+    )
+
+    await db.commit()
+    return await _teacher_response(db, teacher_id)
+
+
+@router.put("/teachers/{teacher_id}")
+async def update_teacher(teacher_id: str, payload: dict, db: AsyncSession = Depends(get_db)):
+    check = await db.execute(
+        text("""
+            SELECT teacher_id
+            FROM public.sss_teacher_master
+            WHERE teacher_id = :teacher_id
+              AND COALESCE(record_status, 'A') <> 'D'
+        """),
+        {"teacher_id": teacher_id},
+    )
+    if not check.mappings().first():
+        raise HTTPException(status_code=404, detail="Teacher not found")
+
+    allowed = {"full_name", "email_id", "phone", "role", "qualification"}
+    updates = {k: v for k, v in payload.items() if k in allowed}
+    mappings_provided = "teaching_mappings" in payload or "assignments" in payload
+
+    if not updates and not mappings_provided:
+        raise HTTPException(status_code=422, detail="No fields to update")
+
+    if "full_name" not in updates and "name" in payload:
+        updates["full_name"] = payload.get("name")
+
+    if "email_id" not in updates and "email" in payload:
+        updates["email_id"] = payload.get("email")
+
+    if "full_name" in updates and not str(updates["full_name"]).strip():
+        raise HTTPException(status_code=422, detail="Name is required")
+
+    if "phone" in updates:
+        phone = str(updates["phone"]).strip()
+        if not phone.isdigit() or len(phone) != 10:
+            raise HTTPException(status_code=422, detail="Phone must contain exactly 10 digits")
+        updates["phone"] = phone
+
+    if "email_id" in updates:
+        email = str(updates["email_id"] or "").strip().lower()
+        if not re.fullmatch(r"[^\s@]+@gmail\.com", email, flags=re.IGNORECASE):
+            raise HTTPException(
+                status_code=422,
+                detail="Teacher email must be a valid Gmail address",
+            )
+
+        # Re-saving the teacher's existing email is allowed.
+        current_email_result = await db.execute(
+            text("""
+                SELECT email_id
+                FROM public.sss_teacher_master
+                WHERE teacher_id = :teacher_id
+                  AND COALESCE(record_status, 'A') <> 'D'
+                LIMIT 1
+            """),
+            {"teacher_id": teacher_id},
+        )
+        current_email_row = current_email_result.mappings().first()
+        current_email = str(
+            current_email_row["email_id"] if current_email_row else ""
+        ).strip().lower()
+
+        # Only reject when the email is actually changed to another
+        # teacher's existing email.
+        if email != current_email:
+            duplicate = await db.execute(
+                text("""
+                    SELECT teacher_id
+                    FROM public.sss_teacher_master
+                    WHERE LOWER(email_id) = LOWER(:email_id)
+                      AND teacher_id <> :teacher_id
+                      AND COALESCE(record_status, 'A') <> 'D'
+                    LIMIT 1
+                """),
+                {"email_id": email, "teacher_id": teacher_id},
+            )
+            if duplicate.mappings().first():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Teacher email already exists",
+                )
+
+        updates["email_id"] = email
+
+    if "role" in updates:
+        role = str(updates["role"]).strip()
+        if role.casefold() == "teacher":
+            role = "Faculty"
+        elif role.casefold() == "faculty":
+            role = "Faculty"
+        elif role.casefold() == "headmaster":
+            role = "Headmaster"
+        if role not in {"Faculty", "Headmaster"}:
+            raise HTTPException(status_code=422, detail="Role must be Faculty or Headmaster")
+        updates["role"] = role
+
+    if updates:
+        sets = ", ".join(f"{key} = :{key}" for key in updates)
+        await db.execute(
+            text(f"""
+                UPDATE public.sss_teacher_master
+                SET {sets}, updated_at = CURRENT_TIMESTAMP
+                WHERE teacher_id = :teacher_id
+                  AND COALESCE(record_status, 'A') <> 'D'
+            """),
+            {**updates, "teacher_id": teacher_id},
+        )
+
+    if mappings_provided:
+        mappings = _normalize_teacher_assignments(payload)
+        if not mappings:
+            raise HTTPException(status_code=422, detail="At least one teaching class and subject is required")
+
+        await _sync_teacher_mappings(db, teacher_id, mappings)
+
+        await db.execute(
+            text("""
+                UPDATE public.sss_teacher_master
+                SET class_id = :class_id,
+                    subject_name = :subject_name,
+                    is_class_teacher = :is_class_teacher,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE teacher_id = :teacher_id
+            """),
+            {
+                "teacher_id": teacher_id,
+                "class_id": mappings[0]["class_id"],
+                "subject_name": mappings[0]["subject_name"],
+                "is_class_teacher": bool(mappings[0]["is_class_teacher"]),
+            },
+        )
+
+    await db.commit()
+    return await _teacher_response(db, teacher_id)
+
+
+@router.delete("/teachers/{teacher_id}")
+async def delete_teacher(teacher_id: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        text("""
+            UPDATE public.sss_teacher_master
+            SET record_status = 'D',
+                is_active = FALSE,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE teacher_id = :teacher_id
+              AND COALESCE(record_status, 'A') <> 'D'
+            RETURNING teacher_id
+        """),
+        {"teacher_id": teacher_id},
+    )
+    row = result.mappings().first()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Teacher not found")
+
+    await db.execute(
+        text(f"""
+            UPDATE {TEACHER_CLASS_SUBJECT_MAP_TABLE}
+            SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP
+            WHERE teacher_id = :teacher_id
+        """),
+        {"teacher_id": teacher_id},
+    )
+    await db.commit()
+
+    return {"message": "Teacher deleted", "teacher_id": row["teacher_id"]}
+
+
+
+# ============================================================
+# OTHERS: NOTICES + EVENTS
+# ============================================================
+
+NOTICE_TABLE = "public.sss_notice_board"
+EVENT_TABLE = "public.sss_events"
+
+
+def _safe_str(value):
+    return str(value or "").strip()
+
+
+def _parse_event_date(value):
+    raw = _safe_str(value)
+    if not raw:
+        return None
+
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail="Event date must be in YYYY-MM-DD format",
+        )
+
+
+@router.get("/notices")
+async def get_notices(
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        text(
+            f"""
+            SELECT
+                notice_id,
+                notice_title,
+                notice_text,
+                target_audience,
+                applicable_class,
+                COALESCE(record_status, 'A') AS record_status,
+                created_datetime,
+                modified_datetime
+            FROM {NOTICE_TABLE}
+            WHERE COALESCE(record_status, 'A') <> 'D'
+            ORDER BY COALESCE(modified_datetime, created_datetime) DESC NULLS LAST,
+                     notice_id DESC
+            """
+        )
+    )
+    return {"items": [dict(row) for row in result.mappings()]}
+
+
+@router.get("/notices/{notice_id}")
+async def get_notice(
+    notice_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        text(
+            f"""
+            SELECT
+                notice_id,
+                notice_title,
+                notice_text,
+                target_audience,
+                applicable_class,
+                COALESCE(record_status, 'A') AS record_status,
+                created_datetime,
+                modified_datetime
+            FROM {NOTICE_TABLE}
+            WHERE notice_id = :notice_id
+              AND COALESCE(record_status, 'A') <> 'D'
+            """
+        ),
+        {"notice_id": notice_id},
+    )
+    row = result.mappings().first()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Notice not found")
+
+    return dict(row)
+
+
+@router.post("/notices")
+async def create_notice(
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    title = _safe_str(payload.get("notice_title"))
+    notice_text = _safe_str(payload.get("notice_text"))
+    target_audience = _safe_str(payload.get("target_audience")).lower()
+    applicable_class = _safe_str(payload.get("applicable_class"))
+
+    if not title:
+        raise HTTPException(status_code=422, detail="Notice title is required")
+
+    if target_audience not in {"all", "students", "teachers"}:
+        raise HTTPException(
+            status_code=422,
+            detail="Notice audience must be For All, Students or Teachers",
+        )
+
+    if target_audience == "students":
+        if applicable_class and applicable_class.upper() != "ALL":
+            try:
+                class_id = int(applicable_class)
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Invalid Class / Section selection",
+                )
+
+            class_check = await db.execute(
+                text("""
+                    SELECT class_id
+                    FROM public.sss_class_master
+                    WHERE class_id = :class_id
+                      AND COALESCE(record_status, 'A') <> 'D'
+                    LIMIT 1
+                """),
+                {"class_id": class_id},
+            )
+            if not class_check.mappings().first():
+                raise HTTPException(
+                    status_code=422,
+                    detail="Selected Class / Section does not exist",
+                )
+            applicable_class = str(class_id)
+        else:
+            applicable_class = None
+    else:
+        applicable_class = None
+
+    result = await db.execute(
+        text(f"SELECT COALESCE(MAX(notice_id), 0) + 1 FROM {NOTICE_TABLE}")
+    )
+    notice_id = int(result.scalar() or 1)
+
+    inserted = await db.execute(
+        text(
+            f"""
+            INSERT INTO {NOTICE_TABLE} (
+                notice_id,
+                notice_title,
+                notice_text,
+                target_audience,
+                applicable_class,
+                record_status,
+                created_datetime,
+                modified_datetime,
+                version_no,
+                is_read
+            )
+            VALUES (
+                :notice_id,
+                :notice_title,
+                :notice_text,
+                :target_audience,
+                :applicable_class,
+                'A',
+                CURRENT_TIMESTAMP,
+                CURRENT_TIMESTAMP,
+                1,
+                FALSE
+            )
+            RETURNING notice_id
+            """
+        ),
+        {
+            "notice_id": notice_id,
+            "notice_title": title,
+            "notice_text": notice_text or None,
+            "target_audience": target_audience,
+            "applicable_class": applicable_class,
+        },
+    )
+
+    row = inserted.mappings().first()
+    if not row:
+        raise HTTPException(status_code=500, detail="Notice could not be created")
+
+    await db.commit()
+    return await get_notice(row["notice_id"], db)
+
+
+@router.put("/notices/{notice_id}")
+async def update_notice(
+    notice_id: int,
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    existing = await db.execute(
+        text(
+            f"""
+            SELECT notice_id
+            FROM {NOTICE_TABLE}
+            WHERE notice_id = :notice_id
+              AND COALESCE(record_status, 'A') <> 'D'
+            """
+        ),
+        {"notice_id": notice_id},
+    )
+
+    if not existing.mappings().first():
+        raise HTTPException(status_code=404, detail="Notice not found")
+
+    title = _safe_str(payload.get("notice_title"))
+    notice_text = _safe_str(payload.get("notice_text"))
+    target_audience = _safe_str(payload.get("target_audience")).lower()
+    applicable_class = _safe_str(payload.get("applicable_class"))
+
+    if not title:
+        raise HTTPException(status_code=422, detail="Notice title is required")
+
+    if target_audience not in {"all", "students", "teachers"}:
+        raise HTTPException(
+            status_code=422,
+            detail="Notice audience must be For All, Students or Teachers",
+        )
+
+    if target_audience == "students":
+        if applicable_class and applicable_class.upper() != "ALL":
+            try:
+                class_id = int(applicable_class)
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Invalid Class / Section selection",
+                )
+
+            class_check = await db.execute(
+                text("""
+                    SELECT class_id
+                    FROM public.sss_class_master
+                    WHERE class_id = :class_id
+                      AND COALESCE(record_status, 'A') <> 'D'
+                    LIMIT 1
+                """),
+                {"class_id": class_id},
+            )
+            if not class_check.mappings().first():
+                raise HTTPException(
+                    status_code=422,
+                    detail="Selected Class / Section does not exist",
+                )
+            applicable_class = str(class_id)
+        else:
+            applicable_class = None
+    else:
+        applicable_class = None
+
+    await db.execute(
+        text(
+            f"""
+            UPDATE {NOTICE_TABLE}
+            SET
+                notice_title = :notice_title,
+                notice_text = :notice_text,
+                target_audience = :target_audience,
+                applicable_class = :applicable_class,
+                modified_datetime = CURRENT_TIMESTAMP,
+                version_no = COALESCE(version_no, 0) + 1
+            WHERE notice_id = :notice_id
+              AND COALESCE(record_status, 'A') <> 'D'
+            """
+        ),
+        {
+            "notice_id": notice_id,
+            "notice_title": title,
+            "notice_text": notice_text or None,
+            "target_audience": target_audience,
+            "applicable_class": applicable_class,
+        },
+    )
+
+    await db.commit()
+    return await get_notice(notice_id, db)
+
+
+@router.delete("/notices/{notice_id}")
+async def delete_notice(
+    notice_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        text(
+            f"""
+            UPDATE {NOTICE_TABLE}
+            SET
+                record_status = 'D',
+                modified_datetime = CURRENT_TIMESTAMP,
+                version_no = COALESCE(version_no, 0) + 1
+            WHERE notice_id = :notice_id
+              AND COALESCE(record_status, 'A') <> 'D'
+            RETURNING notice_id
+            """
+        ),
+        {"notice_id": notice_id},
+    )
+
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Notice not found")
+
+    await db.commit()
+    return {"message": "Notice deleted", "notice_id": row["notice_id"]}
+
+
+@router.get("/events")
+async def get_events(
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        text(
+            f"""
+            SELECT
+                event_id,
+                title,
+                event_type,
+                event_date,
+                description,
+                location,
+                COALESCE(record_status, 'A') AS record_status,
+                created_at
+            FROM {EVENT_TABLE}
+            WHERE COALESCE(record_status, 'A') <> 'D'
+            ORDER BY event_date DESC NULLS LAST, event_id DESC
+            """
+        )
+    )
+    return {"items": [dict(row) for row in result.mappings()]}
+
+
+@router.get("/events/{event_id}")
+async def get_event(
+    event_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        text(
+            f"""
+            SELECT
+                event_id,
+                title,
+                event_type,
+                event_date,
+                description,
+                location,
+                COALESCE(record_status, 'A') AS record_status,
+                created_at
+            FROM {EVENT_TABLE}
+            WHERE event_id = :event_id
+              AND COALESCE(record_status, 'A') <> 'D'
+            """
+        ),
+        {"event_id": event_id},
+    )
+
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    return dict(row)
+
+
+@router.post("/events")
+async def create_event(
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    title = _safe_str(payload.get("title"))
+    event_type = _safe_str(payload.get("event_type"))
+    description = _safe_str(payload.get("description"))
+    location = _safe_str(payload.get("location"))
+    event_date = _parse_event_date(payload.get("event_date"))
+
+    if not title:
+        raise HTTPException(status_code=422, detail="Event title is required")
+
+    if not event_date:
+        raise HTTPException(status_code=422, detail="Event date is required")
+
+    result = await db.execute(
+        text(f"SELECT COALESCE(MAX(event_id), 0) + 1 FROM {EVENT_TABLE}")
+    )
+    event_id = int(result.scalar() or 1)
+
+    inserted = await db.execute(
+        text(
+            f"""
+            INSERT INTO {EVENT_TABLE} (
+                event_id,
+                title,
+                event_type,
+                event_date,
+                description,
+                location,
+                record_status,
+                created_at
+            )
+            VALUES (
+                :event_id,
+                :title,
+                :event_type,
+                :event_date,
+                :description,
+                :location,
+                'A',
+                CURRENT_TIMESTAMP
+            )
+            RETURNING event_id
+            """
+        ),
+        {
+            "event_id": event_id,
+            "title": title,
+            "event_type": event_type or None,
+            "event_date": event_date,
+            "description": description or None,
+            "location": location or None,
+        },
+    )
+
+    row = inserted.mappings().first()
+    if not row:
+        raise HTTPException(status_code=500, detail="Event could not be created")
+
+    await db.commit()
+    return await get_event(row["event_id"], db)
+
+
+@router.put("/events/{event_id}")
+async def update_event(
+    event_id: int,
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    existing = await db.execute(
+        text(
+            f"""
+            SELECT event_id
+            FROM {EVENT_TABLE}
+            WHERE event_id = :event_id
+              AND COALESCE(record_status, 'A') <> 'D'
+            """
+        ),
+        {"event_id": event_id},
+    )
+
+    if not existing.mappings().first():
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    title = _safe_str(payload.get("title"))
+    event_type = _safe_str(payload.get("event_type"))
+    description = _safe_str(payload.get("description"))
+    location = _safe_str(payload.get("location"))
+    event_date = _parse_event_date(payload.get("event_date"))
+
+    if not title:
+        raise HTTPException(status_code=422, detail="Event title is required")
+
+    if not event_date:
+        raise HTTPException(status_code=422, detail="Event date is required")
+
+    await db.execute(
+        text(
+            f"""
+            UPDATE {EVENT_TABLE}
+            SET
+                title = :title,
+                event_type = :event_type,
+                event_date = :event_date,
+                description = :description,
+                location = :location
+            WHERE event_id = :event_id
+              AND COALESCE(record_status, 'A') <> 'D'
+            """
+        ),
+        {
+            "event_id": event_id,
+            "title": title,
+            "event_type": event_type or None,
+            "event_date": event_date,
+            "description": description or None,
+            "location": location or None,
+        },
+    )
+
+    await db.commit()
+    return await get_event(event_id, db)
+
+
+@router.delete("/events/{event_id}")
+async def delete_event(
+    event_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        text(
+            f"""
+            UPDATE {EVENT_TABLE}
+            SET record_status = 'D'
+            WHERE event_id = :event_id
+              AND COALESCE(record_status, 'A') <> 'D'
+            RETURNING event_id
+            """
+        ),
+        {"event_id": event_id},
+    )
+
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    await db.commit()
+    return {"message": "Event deleted", "event_id": row["event_id"]}
